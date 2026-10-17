@@ -79,15 +79,6 @@ public:
   void setRotation(uint8_t n) { rotation = n % 4; }
     void setThreshold(uint16_t th) { threshold = th;}
 
-  // Runtime calibration (raw ADC values at the screen edges, landscape rotation 1 frame).
-  // Defaults are the CYD28_TouchR_CAL_* macros above; override with values stored in NVS.
-  void setCalibration(int16_t xmin, int16_t xmax, int16_t ymin, int16_t ymax) {
-    calXMin = xmin; calXMax = xmax; calYMin = ymin; calYMax = ymax;
-  }
-  void getCalibration(int16_t *xmin, int16_t *xmax, int16_t *ymin, int16_t *ymax) const {
-    *xmin = calXMin; *xmax = calXMax; *ymin = calYMin; *ymax = calYMax;
-  }
-
   volatile bool isrWake=true;
 
 private:
@@ -97,10 +88,6 @@ private:
   void wait(uint_fast8_t del);
   void convertRawXY(int16_t *x, int16_t *y);
   uint8_t rotation=1;
-  int16_t calXMin = CYD28_TouchR_CAL_XMIN;
-  int16_t calXMax = CYD28_TouchR_CAL_XMAX;
-  int16_t calYMin = CYD28_TouchR_CAL_YMIN;
-  int16_t calYMax = CYD28_TouchR_CAL_YMAX;
   int16_t xraw=0, yraw=0, zraw=0;
     uint16_t threshold = CYD28_TouchR_Z_THRESH;
   uint32_t msraw=0x80000000;

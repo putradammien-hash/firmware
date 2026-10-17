@@ -220,30 +220,30 @@ void CYD28_TouchR::convertRawXY(int16_t *x, int16_t *y) {
     int16_t x_tmp = *x, y_tmp = *y, xx, yy;
     switch (rotation) {
         case 0: // PORT0
-            xx = ((y_tmp - calYMin) * sizeY_px) /
-                 (calYMax - calYMin);
-            yy = ((x_tmp - calXMin) * sizeX_px) /
-                 (calXMax - calXMin);
+            xx = ((y_tmp - CYD28_TouchR_CAL_YMIN) * sizeY_px) /
+                 (CYD28_TouchR_CAL_YMAX - CYD28_TouchR_CAL_YMIN);
+            yy = ((x_tmp - CYD28_TouchR_CAL_XMIN) * sizeX_px) /
+                 (CYD28_TouchR_CAL_XMAX - CYD28_TouchR_CAL_XMIN);
             xx = sizeY_px - xx;
             break;
         case 1: // LANDSC0
-            xx = ((x_tmp - calXMin) * sizeX_px) /
-                 (calXMax - calXMin);
-            yy = ((y_tmp - calYMin) * sizeY_px) /
-                 (calYMax - calYMin);
+            xx = ((x_tmp - CYD28_TouchR_CAL_XMIN) * sizeX_px) /
+                 (CYD28_TouchR_CAL_XMAX - CYD28_TouchR_CAL_XMIN);
+            yy = ((y_tmp - CYD28_TouchR_CAL_YMIN) * sizeY_px) /
+                 (CYD28_TouchR_CAL_YMAX - CYD28_TouchR_CAL_YMIN);
             break;
         case 2: // PORT1
-            xx = ((y_tmp - calYMin) * sizeY_px) /
-                 (calYMax - calYMin);
-            yy = ((x_tmp - calXMin) * sizeX_px) /
-                 (calXMax - calXMin);
+            xx = ((y_tmp - CYD28_TouchR_CAL_YMIN) * sizeY_px) /
+                 (CYD28_TouchR_CAL_YMAX - CYD28_TouchR_CAL_YMIN);
+            yy = ((x_tmp - CYD28_TouchR_CAL_XMIN) * sizeX_px) /
+                 (CYD28_TouchR_CAL_XMAX - CYD28_TouchR_CAL_XMIN);
             yy = sizeX_px - yy;
             break;
         default: // 3 LANDSC1
-            xx = ((x_tmp - calXMin) * sizeX_px) /
-                 (calXMax - calXMin);
-            yy = ((y_tmp - calYMin) * sizeY_px) /
-                 (calYMax - calYMin);
+            xx = ((x_tmp - CYD28_TouchR_CAL_XMIN) * sizeX_px) /
+                 (CYD28_TouchR_CAL_XMAX - CYD28_TouchR_CAL_XMIN);
+            yy = ((y_tmp - CYD28_TouchR_CAL_YMIN) * sizeY_px) /
+                 (CYD28_TouchR_CAL_YMAX - CYD28_TouchR_CAL_YMIN);
             xx = sizeX_px - xx;
             yy = sizeY_px - yy;
             break;

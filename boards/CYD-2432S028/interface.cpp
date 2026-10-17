@@ -34,9 +34,14 @@ CYD28_TouchR touch(CYD28_DISPLAY_HOR_RES_MAX, CYD28_DISPLAY_VER_RES_MAX);
 
 /***************************************************************************************
 ** Kalibrasi touch resistif (XPT2046) + penyimpanan NVS
-** Berlaku untuk env resistif yang memakai CYD28_TouchR (CYD-2432S028, CYD-2USB, dst).
-** - Boot pertama (belum ada data di NVS): kalibrasi otomatis 4 titik, lalu disimpan.
-** - Boot berikutnya: data dibaca dari NVS, tidak perlu kalibrasi lagi.
+** Mengikuti contoh bawaan TFT_eSPI (Generic/Touch_calibrate -> tft.calibrateTouch()):
+**  - 4 sudut layar (panah), 8 sampel per sudut, rotasi aktif
+**  - hasil berupa calData[5] = {x0, x_range, y0, y_range, flags}
+**    flags: bit0 = sumbu X/Y sentuhan tertukar, bit1 = invert X, bit2 = invert Y
+**  - konversi raw -> koordinat layar sama dengan TFT_eSPI::convertRawXY()
+** Beda dengan contoh aslinya: data disimpan di NVS (bukan SPIFFS), satu slot per rotasi,
+** dan pembacaan raw memakai library CYD28_TouchR (touch ada di bus SPI terpisah).
+** - Rotasi belum punya data di NVS -> kalibrasi otomatis lalu disimpan.
 ** - Kalibrasi ulang: tahan layar (sentuh terus) saat device dinyalakan / reset.
 ***************************************************************************************/
 #if !defined(HAS_CAPACITIVE_TOUCH) && !defined(USE_TFT_eSPI_TOUCH)
@@ -44,60 +49,103 @@ CYD28_TouchR touch(CYD28_DISPLAY_HOR_RES_MAX, CYD28_DISPLAY_VER_RES_MAX);
 #include <Preferences.h>
 
 #define TCAL_NAMESPACE "touchcal"
-#define TCAL_KEY "cal"
-#define TCAL_MAGIC 0xCA11
+#define TCAL_MAGIC 0xCA12
+#define TCAL_ARROW 15    // ukuran panah sudut (sama dengan contoh TFT_eSPI)
 #define TCAL_HOLD_MS 600 // lama menahan layar saat boot untuk memicu kalibrasi ulang
 
-struct TouchCalData {
+struct TouchCalSlot {
     uint16_t magic;
-    int16_t xmin, xmax, ymin, ymax;
+    uint16_t d[5];
     uint16_t chk;
 };
 
-static uint16_t touchCalChecksum(const TouchCalData &d) {
-    uint16_t c = 0xA5A5;
-    c ^= d.magic;
-    c += (uint16_t)d.xmin;
-    c ^= (uint16_t)d.xmax;
-    c += (uint16_t)d.ymin;
-    c ^= (uint16_t)d.ymax;
+static uint16_t touchCalData[5];  // calData aktif (format TFT_eSPI)
+static bool touchCalActive = false;
+static uint8_t touchCalRot = 255; // rotasi yang calData-nya sedang dipakai
+
+static uint16_t touchCalChecksum(const TouchCalSlot &s) {
+    uint16_t c = 0xA5A5 ^ s.magic;
+    for (int i = 0; i < 5; i++) c = (uint16_t)((c << 3) | (c >> 13)) ^ s.d[i];
     return c;
 }
 
-static bool touchCalSane(int16_t xmin, int16_t xmax, int16_t ymin, int16_t ymax) {
-    int xr = xmax - xmin, yr = ymax - ymin;
-    return xr >= 2000 && xr <= 4500 && yr >= 2000 && yr <= 4500 && xmin > -1500 && xmin < 2000 &&
-           ymin > -1500 && ymin < 2000;
+static bool touchCalSane(const uint16_t *d) {
+    return d[1] >= 1500 && d[1] <= 4500 && d[3] >= 1500 && d[3] <= 4500 && d[0] < 2500 && d[2] < 2500 &&
+           d[4] <= 7;
 }
 
-static bool touchCalLoad(TouchCalData &d) {
+static void touchCalKey(uint8_t rot, char *key) { snprintf(key, 8, "r%u", (unsigned)(rot & 3)); }
+
+static bool touchCalLoad(uint8_t rot, uint16_t *d) {
+    char key[8];
+    touchCalKey(rot, key);
     Preferences prefs;
     if (!prefs.begin(TCAL_NAMESPACE, true)) return false; // read-only
-    size_t len = prefs.getBytesLength(TCAL_KEY);
+    TouchCalSlot s;
     bool ok = false;
-    if (len == sizeof(TouchCalData)) {
-        prefs.getBytes(TCAL_KEY, &d, sizeof(TouchCalData));
-        ok = d.magic == TCAL_MAGIC && d.chk == touchCalChecksum(d) &&
-             touchCalSane(d.xmin, d.xmax, d.ymin, d.ymax);
+    if (prefs.getBytesLength(key) == sizeof(s)) {
+        prefs.getBytes(key, &s, sizeof(s));
+        ok = s.magic == TCAL_MAGIC && s.chk == touchCalChecksum(s) && touchCalSane(s.d);
+        if (ok) memcpy(d, s.d, sizeof(s.d));
     }
     prefs.end();
     return ok;
 }
 
-static bool touchCalSave(int16_t xmin, int16_t xmax, int16_t ymin, int16_t ymax) {
-    TouchCalData d;
-    d.magic = TCAL_MAGIC;
-    d.xmin = xmin;
-    d.xmax = xmax;
-    d.ymin = ymin;
-    d.ymax = ymax;
-    d.chk = touchCalChecksum(d);
-
+static bool touchCalSave(uint8_t rot, const uint16_t *d) {
+    char key[8];
+    touchCalKey(rot, key);
+    TouchCalSlot s;
+    s.magic = TCAL_MAGIC;
+    memcpy(s.d, d, sizeof(s.d));
+    s.chk = touchCalChecksum(s);
     Preferences prefs;
     if (!prefs.begin(TCAL_NAMESPACE, false)) return false;
-    size_t w = prefs.putBytes(TCAL_KEY, &d, sizeof(d));
+    size_t w = prefs.putBytes(key, &s, sizeof(s));
     prefs.end();
-    return w == sizeof(d);
+    return w == sizeof(s);
+}
+
+// Port dari TFT_eSPI::convertRawXY(): raw XPT2046 -> koordinat layar (rotasi aktif)
+static void touchCalConvert(int16_t rawX, int16_t rawY, int16_t &x, int16_t &y) {
+    const int32_t W = tft.width(), H = tft.height();
+    const bool rotate = touchCalData[4] & 0x01;
+    const bool invX = touchCalData[4] & 0x02;
+    const bool invY = touchCalData[4] & 0x04;
+    int32_t a = rotate ? rawY : rawX;
+    int32_t b = rotate ? rawX : rawY;
+    int32_t xx = (a - (int32_t)touchCalData[0]) * W / (int32_t)touchCalData[1];
+    int32_t yy = (b - (int32_t)touchCalData[2]) * H / (int32_t)touchCalData[3];
+    if (invX) xx = W - xx;
+    if (invY) yy = H - yy;
+    if (xx < 0) xx = 0;
+    if (xx > W - 1) xx = W - 1;
+    if (yy < 0) yy = 0;
+    if (yy > H - 1) yy = H - 1;
+    x = xx;
+    y = yy;
+}
+
+// Pastikan data kalibrasi yang aktif sesuai rotasi saat ini (rotasi bisa diubah dari menu Settings).
+// Rotasi tanpa data -> touchCalActive=false (pakai pemetaan lama) sampai kalibrasi di boot berikutnya.
+static void touchCalSyncRotation() {
+    uint8_t rot = bruceConfigPins.rotation & 3;
+    if (rot == touchCalRot) return;
+    touchCalRot = rot;
+    touchCalActive = touchCalLoad(rot, touchCalData);
+}
+
+// Isi p dengan koordinat layar terkalibrasi. false jika belum ada kalibrasi untuk rotasi ini.
+static bool touchCalGetPoint(CYD28_TS_Point &p) {
+    touchCalSyncRotation();
+    if (!touchCalActive) return false;
+    CYD28_TS_Point r = touch.getPointRaw();
+    int16_t x, y;
+    touchCalConvert(r.x, r.y, x, y);
+    p.x = x;
+    p.y = y;
+    p.z = r.z;
+    return true;
 }
 
 // true jika layar ditahan terus-menerus selama TCAL_HOLD_MS (return cepat jika tidak disentuh)
@@ -110,148 +158,169 @@ static bool touchHeldAtBoot() {
     return true;
 }
 
-static void drawCalTarget(int x, int y, uint16_t color) {
-    tft.drawCircle(x, y, 10, color);
-    tft.drawFastHLine(x - 16, y, 33, color);
-    tft.drawFastVLine(x, y - 16, 33, color);
-    tft.fillCircle(x, y, 2, color);
+// Gambar panah di salah satu sudut (sama dengan TFT_eSPI::calibrateTouch)
+static void drawCalCorner(uint8_t i, int W, int H, int size, uint16_t fg, uint16_t bg) {
+    tft.fillRect(0, 0, size + 1, size + 1, bg);
+    tft.fillRect(0, H - size - 1, size + 1, size + 1, bg);
+    tft.fillRect(W - size - 1, 0, size + 1, size + 1, bg);
+    tft.fillRect(W - size - 1, H - size - 1, size + 1, size + 1, bg);
+    switch (i) {
+        case 0: // kiri atas
+            tft.drawLine(0, 0, 0, size, fg);
+            tft.drawLine(0, 0, size, 0, fg);
+            tft.drawLine(0, 0, size, size, fg);
+            break;
+        case 1: // kiri bawah
+            tft.drawLine(0, H - size - 1, 0, H - 1, fg);
+            tft.drawLine(0, H - 1, size, H - 1, fg);
+            tft.drawLine(size, H - size - 1, 0, H - 1, fg);
+            break;
+        case 2: // kanan atas
+            tft.drawLine(W - size - 1, 0, W - 1, 0, fg);
+            tft.drawLine(W - size - 1, size, W - 1, 0, fg);
+            tft.drawLine(W - 1, size, W - 1, 0, fg);
+            break;
+        case 3: // kanan bawah
+            tft.drawLine(W - size - 1, H - size - 1, W - 1, H - 1, fg);
+            tft.drawLine(W - 1, H - 1 - size, W - 1, H - 1, fg);
+            tft.drawLine(W - 1 - size, H - 1, W - 1, H - 1, fg);
+            break;
+    }
 }
 
-// Tunggu sentuhan, ambil rata-rata nilai RAW. false jika timeout / sentuhan terlalu singkat.
-static bool captureRawPoint(int16_t &rx, int16_t &ry) {
-    uint32_t t0 = millis();
-    while (!touch.touched()) {
-        if (millis() - t0 > 20000) return false;
-        delay(10);
-    }
-    int32_t sx = 0, sy = 0;
-    int n = 0;
-    for (int i = 0; i < 14; i++) {
-        delay(20);
-        if (!touch.touched()) break;
-        CYD28_TS_Point p = touch.getPointRaw();
-        if (i < 4) continue; // abaikan sampel awal (belum stabil)
-        sx += p.x;
-        sy += p.y;
-        n++;
-    }
-    // tunggu jari dilepas
-    t0 = millis();
-    int released = 0;
-    while (released < 4 && millis() - t0 < 3000) {
-        released = touch.touched() ? 0 : released + 1;
-        delay(20);
-    }
-    delay(250);
-    if (n < 5) return false;
-    rx = sx / n;
-    ry = sy / n;
-    return true;
-}
+// Port dari TFT_eSPI::calibrateTouch(): urutan sudut kiri-atas, kiri-bawah, kanan-atas, kanan-bawah.
+// false jika timeout (tidak ada sentuhan) atau hasil tidak masuk akal.
+static bool touchCalibrate(uint16_t *params) {
+    const int W = tft.width(), H = tft.height(), size = TCAL_ARROW;
+    const uint16_t fg = TFT_MAGENTA, bg = TFT_BLACK;
+    int32_t v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
-static bool runTouchCalibration(int16_t &xmin, int16_t &xmax, int16_t &ymin, int16_t &ymax) {
-    const int W = CYD28_DISPLAY_HOR_RES_MAX; // 320
-    const int H = CYD28_DISPLAY_VER_RES_MAX; // 240
-    const int M = 25;
-    const int px[4] = {M, W - M, M, W - M};
-    const int py[4] = {M, M, H - M, H - M};
+    for (uint8_t i = 0; i < 4; i++) {
+        tft.fillScreen(bg);
+        tft.setTextColor(TFT_WHITE, bg);
+        tft.setTextSize(1);
+        tft.drawCentreString("Kalibrasi layar", W / 2, H / 2 - 20, 1);
+        tft.drawCentreString("Sentuh ujung panah", W / 2, H / 2 - 5, 1);
+        tft.drawCentreString("(tahan sampai 8 sampel)", W / 2, H / 2 + 10, 1);
+        drawCalCorner(i, W, H, size, fg, bg);
+        if (i > 0) delay(1000); // beri waktu melepas jari
 
-    // Kalibrasi dilakukan di rotasi 1 (landscape), di mana koordinat library == koordinat layar.
-    // Rotasi pengguna dipulihkan setelah selesai.
-    tft.setRotation(1);
-    tft.setRotation(1);
-
-    bool success = false;
-    for (int attempt = 0; attempt < 3 && !success; attempt++) {
-        int16_t rawX[4], rawY[4];
-        bool aborted = false;
-
-        for (int i = 0; i < 4 && !aborted; i++) {
-            bool got = false;
-            for (int tries = 0; tries < 3 && !got; tries++) {
-                tft.fillScreen(TFT_BLACK);
-                tft.setTextColor(TFT_WHITE, TFT_BLACK);
-                tft.setTextSize(2);
-                tft.drawCentreString("Kalibrasi Layar", W / 2, 85, 1);
-                tft.setTextSize(1);
-                char msg[32];
-                snprintf(msg, sizeof(msg), "Sentuh titik target (%d/4)", i + 1);
-                tft.drawCentreString(msg, W / 2, 115, 1);
-                tft.drawCentreString("Gunakan stylus / ujung jari", W / 2, 130, 1);
-                drawCalTarget(px[i], py[i], TFT_RED);
-                got = captureRawPoint(rawX[i], rawY[i]);
+        uint32_t t0 = millis();
+        for (uint8_t j = 0; j < 8;) {
+            if (millis() - t0 > 20000) return false; // timeout
+            if (!touch.touched()) {
+                delay(5);
+                continue;
             }
-            if (!got) aborted = true;
+            CYD28_TS_Point r = touch.getPointRaw();
+            v[i * 2] += r.x;
+            v[i * 2 + 1] += r.y;
+            j++;
+            delay(15);
         }
-        if (aborted) break; // timeout: jangan simpan, pakai nilai default
-
-        // Dua titik di kolom/baris yang sama harus punya nilai raw yang berdekatan
-        bool consistent = abs(rawX[0] - rawX[2]) < 400 && abs(rawX[1] - rawX[3]) < 400 &&
-                          abs(rawY[0] - rawY[1]) < 400 && abs(rawY[2] - rawY[3]) < 400;
-
-        float lx = (rawX[0] + rawX[2]) / 2.0f, rx = (rawX[1] + rawX[3]) / 2.0f;
-        float ty = (rawY[0] + rawY[1]) / 2.0f, by = (rawY[2] + rawY[3]) / 2.0f;
-        float kx = (rx - lx) / (float)(px[1] - px[0]); // raw per piksel
-        float ky = (by - ty) / (float)(py[2] - py[0]);
-
-        int16_t nxmin = (int16_t)roundf(lx - px[0] * kx);
-        int16_t nxmax = (int16_t)roundf(lx - px[0] * kx + W * kx);
-        int16_t nymin = (int16_t)roundf(ty - py[0] * ky);
-        int16_t nymax = (int16_t)roundf(ty - py[0] * ky + H * ky);
-
-        Serial.printf("Touch cal raw: (%d,%d) (%d,%d) (%d,%d) (%d,%d)\n", rawX[0], rawY[0], rawX[1],
-                      rawY[1], rawX[2], rawY[2], rawX[3], rawY[3]);
-
-        if (consistent && touchCalSane(nxmin, nxmax, nymin, nymax)) {
-            xmin = nxmin;
-            xmax = nxmax;
-            ymin = nymin;
-            ymax = nymax;
-            success = true;
-        } else {
-            tft.fillScreen(TFT_BLACK);
-            tft.setTextColor(TFT_RED, TFT_BLACK);
-            tft.setTextSize(2);
-            tft.drawCentreString("Gagal, ulangi", W / 2, 105, 1);
-            delay(1200);
-        }
+        v[i * 2] /= 8;
+        v[i * 2 + 1] /= 8;
     }
 
-    if (success) {
-        tft.fillScreen(TFT_BLACK);
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
-        tft.setTextSize(2);
-        tft.drawCentreString("Kalibrasi OK", W / 2, 105, 1);
-        delay(700);
+    bool rotate = false, invX = false, invY = false;
+    int32_t x0, x1, y0, y1;
+    // Dari sudut 0 ke 1 nilai Y layar berubah. Jika perubahan X raw lebih besar dari Y raw,
+    // sumbu sentuhan dan layar tertukar.
+    if (abs(v[0] - v[2]) > abs(v[1] - v[3])) {
+        rotate = true;
+        x0 = (v[1] + v[3]) / 2;
+        x1 = (v[5] + v[7]) / 2;
+        y0 = (v[0] + v[4]) / 2;
+        y1 = (v[2] + v[6]) / 2;
+    } else {
+        x0 = (v[0] + v[2]) / 2;
+        x1 = (v[4] + v[6]) / 2;
+        y0 = (v[1] + v[5]) / 2;
+        y1 = (v[3] + v[7]) / 2;
     }
+    if (x0 > x1) {
+        int32_t t = x0;
+        x0 = x1;
+        x1 = t;
+        invX = true;
+    }
+    if (y0 > y1) {
+        int32_t t = y0;
+        y0 = y1;
+        y1 = t;
+        invY = true;
+    }
+    x1 -= x0;
+    y1 -= y0;
+    if (x0 == 0) x0 = 1;
+    if (x1 == 0) x1 = 1;
+    if (y0 == 0) y0 = 1;
+    if (y1 == 0) y1 = 1;
 
-    tft.setRotation(bruceConfigPins.rotation);
-    tft.setRotation(bruceConfigPins.rotation);
-    tft.fillScreen(bruceConfig.bgColor);
-    return success;
+    Serial.printf(
+        "Touch cal raw: UL(%d,%d) BL(%d,%d) UR(%d,%d) BR(%d,%d)\n", (int)v[0], (int)v[1], (int)v[2],
+        (int)v[3], (int)v[4], (int)v[5], (int)v[6], (int)v[7]
+    );
+
+    if (x0 < 0 || y0 < 0) return false;
+    params[0] = x0;
+    params[1] = x1;
+    params[2] = y0;
+    params[3] = y1;
+    params[4] = (rotate ? 1 : 0) | (invX ? 2 : 0) | (invY ? 4 : 0);
+    return touchCalSane(params);
 }
 
 // Dipanggil dari _post_setup_gpio() setelah TFT & backlight siap.
 static void touchCalibrationInit() {
-    TouchCalData d;
-    bool haveSaved = touchCalLoad(d);
+    const uint8_t rot = bruceConfigPins.rotation & 3;
+    touchCalRot = rot;
+    uint16_t d[5];
+    bool haveSaved = touchCalLoad(rot, d);
 
     if (haveSaved && !touchHeldAtBoot()) {
-        touch.setCalibration(d.xmin, d.xmax, d.ymin, d.ymax);
-        Serial.printf("Touch cal dari NVS: %d,%d,%d,%d\n", d.xmin, d.xmax, d.ymin, d.ymax);
+        memcpy(touchCalData, d, sizeof(d));
+        touchCalActive = true;
+        Serial.printf(
+            "Touch cal (rot %u) dari NVS: %u,%u,%u,%u,%u\n", rot, d[0], d[1], d[2], d[3], d[4]
+        );
         return;
     }
 
-    int16_t xmin, xmax, ymin, ymax;
-    if (runTouchCalibration(xmin, xmax, ymin, ymax)) {
-        touch.setCalibration(xmin, xmax, ymin, ymax);
-        if (touchCalSave(xmin, xmax, ymin, ymax)) Serial.println("Touch cal tersimpan ke NVS");
+    tft.setRotation(bruceConfigPins.rotation);
+    tft.setRotation(bruceConfigPins.rotation);
+
+    uint16_t n[5];
+    bool ok = false;
+    for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+        ok = touchCalibrate(n);
+        if (!ok) {
+            tft.fillScreen(TFT_BLACK);
+            tft.setTextColor(TFT_RED, TFT_BLACK);
+            tft.setTextSize(2);
+            tft.drawCentreString("Gagal, ulangi", tft.width() / 2, tft.height() / 2 - 8, 1);
+            delay(1200);
+        }
+    }
+
+    if (ok) {
+        memcpy(touchCalData, n, sizeof(n));
+        touchCalActive = true;
+        if (touchCalSave(rot, n)) Serial.println("Touch cal tersimpan ke NVS");
         else Serial.println("Touch cal GAGAL disimpan ke NVS");
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.setTextSize(2);
+        tft.drawCentreString("Kalibrasi OK", tft.width() / 2, tft.height() / 2 - 8, 1);
+        delay(700);
     } else if (haveSaved) {
         // kalibrasi ulang dibatalkan -> tetap pakai data lama
-        touch.setCalibration(d.xmin, d.xmax, d.ymin, d.ymax);
+        memcpy(touchCalData, d, sizeof(d));
+        touchCalActive = true;
     }
-    // else: pakai nilai default dari library
+    // else: touchCalActive=false -> pakai pemetaan bawaan library (nilai default)
+
+    tft.fillScreen(bruceConfig.bgColor);
 }
 #endif // resistive touch NVS calibration
 
@@ -468,24 +537,37 @@ void InputHandler(void) {
             tm = millis();
 #else
         if (touch.touched()) {
+#if defined(CYD_RES_TOUCH_NVS_CAL)
+            CYD28_TS_Point t;
+            // Terkalibrasi (NVS): koordinat sudah sesuai rotasi aktif, rotasi manual dilewati
+            bool touchCalibrated = touchCalGetPoint(t);
+            if (!touchCalibrated) t = touch.getPointScaled();
+#else
             auto t = touch.getPointScaled();
+#endif
 #endif
 #if !defined(TOUCH_GT911_I2C)
             // Serial.printf("\nRAW: Touch Pressed on x=%d, y=%d",t.x, t.y);
-            if (bruceConfigPins.rotation == 3) {
-                t.y = (tftHeight + 20) - t.y;
-                t.x = tftWidth - t.x;
+#if defined(CYD_RES_TOUCH_NVS_CAL)
+            if (!touchCalibrated) {
+#endif
+                if (bruceConfigPins.rotation == 3) {
+                    t.y = (tftHeight + 20) - t.y;
+                    t.x = tftWidth - t.x;
+                }
+                if (bruceConfigPins.rotation == 0) {
+                    int tmp = t.x;
+                    t.x = tftWidth - t.y;
+                    t.y = tmp;
+                }
+                if (bruceConfigPins.rotation == 2) {
+                    int tmp = t.x;
+                    t.x = t.y;
+                    t.y = (tftHeight + 20) - tmp;
+                }
+#if defined(CYD_RES_TOUCH_NVS_CAL)
             }
-            if (bruceConfigPins.rotation == 0) {
-                int tmp = t.x;
-                t.x = tftWidth - t.y;
-                t.y = tmp;
-            }
-            if (bruceConfigPins.rotation == 2) {
-                int tmp = t.x;
-                t.x = t.y;
-                t.y = (tftHeight + 20) - tmp;
-            }
+#endif
 #endif
             // Serial.printf("\nROT: Touch Pressed on x=%d, y=%d\n", t.x, t.y);
 
